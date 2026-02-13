@@ -470,6 +470,16 @@ def build_agent_tree(entries: list[LogEntry]) -> list[SessionNode]:
         sess.is_active = True
         sessions.append(sess)
 
+    # Expire stale agents: if spawned >1 hour ago with no finish event,
+    # assume the finish event was lost and stop showing them as running.
+    now = datetime.now()
+    for sess in sessions:
+        for agent in sess.agents:
+            if agent.is_running:
+                started = _parse_timestamp(agent.start_time)
+                if started and (now - started).total_seconds() > 3600:
+                    agent.is_running = False
+
     return sessions
 
 
