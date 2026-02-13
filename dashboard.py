@@ -136,55 +136,30 @@ def read_model_stats() -> list[dict]:
     return models
 
 
+# Emoji → count key mapping for event tallying
+EMOJI_COUNT_MAP = {
+    "🔧": "tools", "📖": "reads", "🔍": "searches", "🌐": "fetches",
+    "🔌": "mcp", "⚡": "skills", "🚀": "agents", "🤖": "subagents",
+    "🛬": "landed", "🏁": "finished", "📐": "plans", "🟢": "sessions",
+    "🔴": "ended", "👋": "input", "🔐": "permission", "❓": "questions",
+    "✅": "completed", "⚠️": "compacts",
+}
+
+# "📋 Task created" needs a substring match, not just emoji presence
+_TASK_CREATED_MARKER = "📋 Task created"
+
+
 def count_events(lines: list[str]) -> dict:
     """Count events by emoji from log lines."""
-    counts = {
-        "tools": 0, "reads": 0, "searches": 0, "fetches": 0,
-        "mcp": 0, "agents": 0, "subagents": 0, "landed": 0, "finished": 0,
-        "plans": 0, "tasks": 0, "sessions": 0, "ended": 0,
-        "input": 0, "permission": 0, "questions": 0,
-        "completed": 0, "compacts": 0, "skills": 0,
-    }
+    counts = {key: 0 for key in EMOJI_COUNT_MAP.values()}
+    counts["tasks"] = 0
     for line in lines:
         clean = strip_ansi(line)
-        if "🔧" in clean:
-            counts["tools"] += 1
-        if "📖" in clean:
-            counts["reads"] += 1
-        if "🔍" in clean:
-            counts["searches"] += 1
-        if "🌐" in clean:
-            counts["fetches"] += 1
-        if "🔌" in clean:
-            counts["mcp"] += 1
-        if "⚡" in clean:
-            counts["skills"] += 1
-        if "🚀" in clean:
-            counts["agents"] += 1
-        if "🤖" in clean:
-            counts["subagents"] += 1
-        if "🛬" in clean:
-            counts["landed"] += 1
-        if "🏁" in clean:
-            counts["finished"] += 1
-        if "📐" in clean:
-            counts["plans"] += 1
-        if "📋 Task created" in clean:
+        for emoji, key in EMOJI_COUNT_MAP.items():
+            if emoji in clean:
+                counts[key] += 1
+        if _TASK_CREATED_MARKER in clean:
             counts["tasks"] += 1
-        if "🟢" in clean:
-            counts["sessions"] += 1
-        if "🔴" in clean:
-            counts["ended"] += 1
-        if "👋" in clean:
-            counts["input"] += 1
-        if "🔐" in clean:
-            counts["permission"] += 1
-        if "❓" in clean:
-            counts["questions"] += 1
-        if "✅" in clean:
-            counts["completed"] += 1
-        if "⚠️" in clean:
-            counts["compacts"] += 1
     return counts
 
 
@@ -213,10 +188,21 @@ class LogEntry:
         return True
 
 
+# All emojis to search for when identifying event type (EVENT_STYLES keys + extras)
+_ALL_EVENT_EMOJIS = list(EVENT_STYLES.keys()) + ["🔧", "📖", "🔍", "📋", "🟢", "🔴", "📐"]
+# Deduplicate while preserving order (EVENT_STYLES takes priority)
+_ALL_EVENT_EMOJIS = list(dict.fromkeys(_ALL_EVENT_EMOJIS))
+
+
 def parse_log_line(raw_line: str) -> LogEntry:
     """Parse a pipe-delimited log line into a LogEntry."""
     clean = strip_ansi(raw_line)
     style = style_for_line(raw_line)
+
+    timestamp = ""
+    project = ""
+    branch = ""
+    event = clean.strip()
 
     parts = clean.split("│")
     if len(parts) >= 4:
@@ -226,25 +212,13 @@ def parse_log_line(raw_line: str) -> LogEntry:
         event = "│".join(parts[3:]).strip()
     elif len(parts) >= 2:
         timestamp = parts[0].strip()
-        project = ""
-        branch = ""
         event = "│".join(parts[1:]).strip()
-    else:
-        timestamp = ""
-        project = ""
-        branch = ""
-        event = clean.strip()
 
     emoji = ""
-    for e in EVENT_STYLES:
+    for e in _ALL_EVENT_EMOJIS:
         if e in event:
             emoji = e
             break
-    if not emoji:
-        for e in ["🔧", "📖", "🔍", "📋", "🟢", "🔴", "📐"]:
-            if e in event:
-                emoji = e
-                break
 
     return LogEntry(
         raw=clean,
@@ -312,6 +286,11 @@ class LogTailer:
             pass
 
 
+def _normalize_project_key(name: str) -> str:
+    """Normalize a project name for fuzzy matching (lowercase, no separators)."""
+    return name.lower().replace("-", "").replace("_", "")
+
+
 def _project_color(project: str, known: dict[str, str]) -> str:
     """Stable color for a project name."""
     if project not in known:
@@ -341,6 +320,9 @@ def _format_tokens(n: int) -> str:
     if n >= 1_000:
         return f"{n / 1_000:.0f}K"
     return str(n)
+
+
+TIME_RANGE_LABELS = {"Today": "Today", "7d": "7 Days", "All": "All Time"}
 
 
 # ─── Time helpers ────────────────────────────────────────────────────────────
@@ -486,6 +468,15 @@ def build_agent_tree(entries: list[LogEntry]) -> list[SessionNode]:
 def _count_active_sessions(sessions: list[SessionNode]) -> int:
     """Count sessions that are currently active."""
     return sum(1 for s in sessions if s.is_active)
+
+
+def _build_active_session_map(sessions: list[SessionNode]) -> dict[str, SessionNode]:
+    """Build a lookup from normalized project key to the active session."""
+    session_map: dict[str, SessionNode] = {}
+    for sess in sessions:
+        if sess.is_active:
+            session_map[_normalize_project_key(sess.project)] = sess
+    return session_map
 
 
 # ─── Process scanner ─────────────────────────────────────────────────────────
@@ -1089,20 +1080,25 @@ class ClaudeDashboardApp(App):
 
         self._update_filter_indicators()
 
+    def _build_entry_prefix(self, entry: LogEntry) -> Text:
+        """Build the shared timestamp | project | branch prefix for a log line."""
+        text = Text()
+        text.append(entry.timestamp, style="dim")
+        if entry.project:
+            color = _project_color(entry.project, self._project_colors)
+            text.append(" │ ", style="dim")
+            text.append(entry.project, style=color)
+            text.append(" │ ", style="dim")
+            text.append(entry.branch or "-", style="dim")
+        text.append(" │ ", style="dim")
+        return text
+
     def _write_entry(self, log_widget: RichLog, entry) -> None:
         """Write a single LogEntry (or compact group) to the log widget."""
         if isinstance(entry, dict):
             sample = entry["sample"]
             count = entry["count"]
-            text = Text()
-            text.append(sample.timestamp, style="dim")
-            if sample.project:
-                color = _project_color(sample.project, self._project_colors)
-                text.append(" │ ", style="dim")
-                text.append(sample.project, style=color)
-                text.append(" │ ", style="dim")
-                text.append(sample.branch or "-", style="dim")
-            text.append(" │ ", style="dim")
+            text = self._build_entry_prefix(sample)
             text.append(f"{sample.emoji} ", style=sample.style)
             base = sample.event
             if sample.emoji:
@@ -1112,15 +1108,7 @@ class ClaudeDashboardApp(App):
             text.append(f"{base} (x{count})", style=sample.style)
             log_widget.write(text)
         else:
-            text = Text()
-            text.append(entry.timestamp, style="dim")
-            if entry.project:
-                color = _project_color(entry.project, self._project_colors)
-                text.append(" │ ", style="dim")
-                text.append(entry.project, style=color)
-                text.append(" │ ", style="dim")
-                text.append(entry.branch or "-", style="dim")
-            text.append(" │ ", style="dim")
+            text = self._build_entry_prefix(entry)
             display_event = entry.event.replace("📋 Task created", "📋 Todo created").replace("📋 Task completed", "📋 Todo completed")
             # Shorten model IDs in session started lines: [claude-opus-4-6] → [Opus 4.6]
             m = re.search(r"\[(claude-[^\]]+)\]", display_event)
@@ -1255,7 +1243,7 @@ class ClaudeDashboardApp(App):
     def _update_token_panel(self) -> None:
         """Token panel — shows per-model tokens for the selected time range."""
         rng = self._stats_time_range
-        title_label = {"Today": "Today", "7d": "7 Days", "All": "All Time"}.get(rng, rng)
+        title_label = TIME_RANGE_LABELS.get(rng, rng)
         table = Table(
             show_header=False, show_edge=False, box=None, padding=(0, 1),
             title=f"[bold]🪙 Tokens ({title_label})[/]", title_style="bold",
@@ -1299,7 +1287,6 @@ class ClaudeDashboardApp(App):
             # Today / 7d — aggregate dailyModelTokens + live model-stats
             daily_model = self._stats_cache.get("dailyModelTokens", [])
             today_str = datetime.now().strftime("%Y-%m-%d")
-            last_computed = self._stats_cache.get("lastComputedDate", "")
 
             # Aggregate cached daily data for the date range
             model_totals: dict[str, int] = {}
@@ -1310,7 +1297,7 @@ class ClaudeDashboardApp(App):
 
             # If today is in the range and cache is stale, add live model-stats
             live_models = []
-            if today_str in date_filter and last_computed != today_str:
+            if today_str in date_filter and self._is_cache_stale_for_today():
                 live_models = read_model_stats()
                 for m in live_models:
                     mid = m["model"]
@@ -1356,11 +1343,7 @@ class ClaudeDashboardApp(App):
         spinner = BRAILLE_SPINNER[self._spinner_idx % len(BRAILLE_SPINNER)]
 
         # Use cached sessions for enrichment (subagents)
-        session_map: dict[str, SessionNode] = {}
-        for sess in self._cached_sessions:
-            if sess.is_active:
-                key = sess.project.lower().replace("-", "").replace("_", "")
-                session_map[key] = sess
+        session_map = _build_active_session_map(self._cached_sessions)
 
         # Deduplicate: one entry per project, keep most active
         by_project: dict[str, ProcessInstance] = {}
@@ -1395,7 +1378,7 @@ class ClaudeDashboardApp(App):
             name = inst.project_name[:20]
 
             # Match with event log for subagents
-            norm_key = inst.project_name.lower().replace("-", "").replace("_", "")
+            norm_key = _normalize_project_key(inst.project_name)
             session = session_map.get(norm_key)
             running_agents = []
             if session:
@@ -1481,11 +1464,7 @@ class ClaudeDashboardApp(App):
 
         # Build session map for enrichment
         sessions = build_agent_tree(self.tailer.all_entries)
-        session_map: dict[str, SessionNode] = {}
-        for sess in sessions:
-            if sess.is_active:
-                key = sess.project.lower().replace("-", "").replace("_", "")
-                session_map[key] = sess
+        session_map = _build_active_session_map(sessions)
 
         spinner = BRAILLE_SPINNER[self._spinner_idx % len(BRAILLE_SPINNER)]
 
@@ -1545,9 +1524,11 @@ class ClaudeDashboardApp(App):
                 info.append("☕", style="#87d787")
 
             # Match with event log for model info
-            norm_key = inst.project_name.lower().replace("-", "").replace("_", "")
+            norm_key = _normalize_project_key(inst.project_name)
             session = session_map.get(norm_key)
-            if session and session.model and len(info) == 0:
+            if session and session.model:
+                if len(info) > 0:
+                    info.append("  ", style="")
                 info.append(format_model_name(session.model), style="dim")
 
             # Directory (shortened)
@@ -1642,6 +1623,30 @@ class ClaudeDashboardApp(App):
         if self._is_stats_tab():
             self._refresh_stats_tab()
 
+    def _count_live_today_activity(self) -> tuple[int, int]:
+        """Count today's sessions and messages from the live event log.
+
+        Returns (sessions, messages) for entries matching today's date.
+        """
+        live_entries = self._filter_entries_by_time(self.tailer.all_entries)
+        today_mmdd = datetime.now().strftime("%m/%d")
+        sessions = 0
+        messages = 0
+        for entry in live_entries:
+            ts = entry.timestamp.strip()
+            if not re.match(r"\d{2}/\d{2}", ts) or not ts.startswith(today_mmdd):
+                continue
+            if "🟢" in entry.event and "Session started" in entry.event:
+                sessions += 1
+            if "🏁" in entry.event:
+                messages += 1
+        return sessions, messages
+
+    def _is_cache_stale_for_today(self) -> bool:
+        """Check if the stats cache is missing today's data."""
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        return self._stats_cache.get("lastComputedDate", "") != today_str
+
     def _refresh_stats_tab(self) -> None:
         data = self._stats_cache
         if not data:
@@ -1653,22 +1658,15 @@ class ClaudeDashboardApp(App):
         """Filter daily data by the current time range selection."""
         if not daily:
             return daily
-        rng = self._stats_time_range
-        if rng == "All":
-            return daily
-        now = datetime.now()
-        if rng == "Today":
-            valid = {now.strftime("%Y-%m-%d")}
-        elif rng == "7d":
-            valid = {(now - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)}
-        else:
+        valid = self._get_daily_token_dates()
+        if valid is None:
             return daily
         return [d for d in daily if d.get("date", "") in valid]
 
     def _update_stats_summary(self, data: dict) -> None:
         """Stats summary — respects time range filter."""
         rng = self._stats_time_range
-        title_label = {"Today": "Today", "7d": "7 Days", "All": "All Time"}.get(rng, rng)
+        title_label = TIME_RANGE_LABELS.get(rng, rng)
         daily = self._filter_daily_by_range(data.get("dailyActivity", []))
 
         if rng == "All":
@@ -1681,23 +1679,12 @@ class ClaudeDashboardApp(App):
             days_active = len(daily)
 
             # Supplement with live event log if cache is stale for today
-            today_str = datetime.now().strftime("%Y-%m-%d")
-            last_computed = data.get("lastComputedDate", "")
-            if last_computed != today_str:
-                live_entries = self._filter_entries_by_time(self.tailer.all_entries)
-                today_mmdd = datetime.now().strftime("%m/%d")
-                for entry in live_entries:
-                    ts = entry.timestamp.strip()
-                    if not re.match(r"\d{2}/\d{2}", ts) or not ts.startswith(today_mmdd):
-                        continue
-                    if "🟢" in entry.event and "Session started" in entry.event:
-                        sessions += 1
-                    if "🏁" in entry.event:
-                        messages += 1
-                if days_active == 0:
-                    # Live entries exist for today but cache has no entry
-                    if any(e.timestamp.strip().startswith(today_mmdd) for e in live_entries):
-                        days_active = 1
+            if self._is_cache_stale_for_today():
+                live_sessions, live_messages = self._count_live_today_activity()
+                sessions += live_sessions
+                messages += live_messages
+                if days_active == 0 and (live_sessions > 0 or live_messages > 0):
+                    days_active = 1
 
         first_date = data.get("firstSessionDate", "")
 
@@ -1739,9 +1726,7 @@ class ClaudeDashboardApp(App):
         daily_model = data.get("dailyModelTokens", [])
         daily_activity = data.get("dailyActivity", [])
         # Check if live data might be available even if cache is empty
-        today_str_check = datetime.now().strftime("%Y-%m-%d")
-        last_computed_check = data.get("lastComputedDate", "")
-        has_live = last_computed_check != today_str_check and read_model_stats()
+        has_live = self._is_cache_stale_for_today() and read_model_stats()
         if not daily_model and not has_live:
             self.query_one("#stats-daily-tokens", Static).update(
                 Text("  No daily token data available", style="dim")
@@ -1761,15 +1746,14 @@ class ClaudeDashboardApp(App):
 
         # Filter by current time range
         rng = self._stats_time_range
-        title_label = {"Today": "Today", "7d": "7 Days", "All": "All Time"}.get(rng, rng)
+        title_label = TIME_RANGE_LABELS.get(rng, rng)
         filtered = self._filter_daily_by_range(daily_model)
 
         # Supplement with live data for today if cache is stale
         today_str = datetime.now().strftime("%Y-%m-%d")
-        last_computed = data.get("lastComputedDate", "")
         date_filter = self._get_daily_token_dates()
         if date_filter is None or today_str in date_filter:
-            if last_computed != today_str:
+            if self._is_cache_stale_for_today():
                 live_models = read_model_stats()
                 if live_models:
                     # Find or create today's entry
@@ -1788,18 +1772,7 @@ class ClaudeDashboardApp(App):
                     model_list = sorted(all_models)
 
                 # Also add live activity data for today
-                live_entries = self._filter_entries_by_time(self.tailer.all_entries)
-                today_mmdd = datetime.now().strftime("%m/%d")
-                live_sessions = 0
-                live_messages = 0
-                for entry in live_entries:
-                    ts = entry.timestamp.strip()
-                    if not re.match(r"\d{2}/\d{2}", ts) or not ts.startswith(today_mmdd):
-                        continue
-                    if "🟢" in entry.event and "Session started" in entry.event:
-                        live_sessions += 1
-                    if "🏁" in entry.event:
-                        live_messages += 1
+                live_sessions, live_messages = self._count_live_today_activity()
                 if live_sessions > 0 or live_messages > 0:
                     act = activity_map.get(today_str, {})
                     act["messageCount"] = act.get("messageCount", 0) + live_messages
