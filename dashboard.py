@@ -713,7 +713,7 @@ class ProcessScanner:
                 uptime_display=_format_uptime(etime),
                 cwd=cwd,
                 project_name=project_name,
-                is_active=cpu > 1.0,
+                is_active=cpu > 1.0 or has_caffeinate,
                 claude_version=claude_version,
                 mcp_server_count=mcp_count,
                 has_shell=has_shell,
