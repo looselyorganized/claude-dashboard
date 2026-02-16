@@ -26,6 +26,14 @@ python3 dashboard.py
 
 The dashboard picks up data from `~/.claude/` automatically — just make sure [Claude Code](https://claude.ai/code) is installed and has been used at least once.
 
+To launch it from anywhere as `claude-dash`, add this to your `~/.zshrc` (or `~/.bashrc`):
+
+```bash
+alias claude-dash="python3 /path/to/claude-dashboard/dashboard.py"
+```
+
+Then reload your shell (`source ~/.zshrc`) and run `claude-dash` from any directory.
+
 ## Keyboard Shortcuts
 
 | Key | Action |
