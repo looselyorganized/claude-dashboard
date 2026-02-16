@@ -17,19 +17,14 @@ Claude Code writes event logs, token stats, and process data to `~/.claude/` as 
 
 ## Quick Start
 
-### Install dependencies
-
 ```bash
+git clone https://github.com/mhofwell/claude-dashboard.git
+cd claude-dashboard
 pip install textual rich
-```
-
-### Run the dashboard
-
-```bash
 python3 dashboard.py
 ```
 
-That's it. The dashboard picks up data from `~/.claude/` automatically — just make sure Claude Code is installed and has been used at least once.
+The dashboard picks up data from `~/.claude/` automatically — just make sure [Claude Code](https://claude.ai/code) is installed and has been used at least once.
 
 ## Keyboard Shortcuts
 
