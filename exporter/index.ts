@@ -12,12 +12,11 @@
 
 import {
   LogTailer,
-  readTokenStats,
   readModelStats,
   readStatsCache,
   type LogEntry,
 } from "./parsers";
-import { scanProcesses, getFacilityState } from "./process-scanner";
+import { getFacilityState } from "./process-scanner";
 import { scanProjectTokens, computeTokensByProject } from "./project-scanner";
 import {
   initSupabase,
@@ -132,6 +131,12 @@ function filterAndMapEntries(entries: LogEntry[]): LogEntry[] {
 // Cache project token totals for facility status updates
 let cachedTokensByProject: Record<string, number> = {};
 
+// Cache all seen log entries to avoid re-reading the entire events.log
+let allSeenEntries: LogEntry[] = [];
+
+// Cache model stats — only re-read from disk when new events arrive
+let cachedModelStats: ReturnType<typeof readModelStats> = [];
+
 // ─── Ensure projects exist ─────────────────────────────────────────────────
 
 async function ensureProjects(entries: LogEntry[]) {
@@ -165,8 +170,9 @@ async function ensureProjects(entries: LogEntry[]) {
 
 // ─── Compute today's tokens ────────────────────────────────────────────────
 
-function computeTodayTokens(): number {
-  const statsCache = readStatsCache();
+function computeTodayTokens(
+  statsCache: ReturnType<typeof readStatsCache>
+): number {
   if (!statsCache?.dailyModelTokens) return 0;
 
   const today = new Date().toISOString().split("T")[0];
@@ -237,6 +243,7 @@ async function backfill() {
   // 1. Read all events
   console.log("  Reading events.log...");
   const allEntries = tailer.readAll();
+  allSeenEntries = allEntries;
   console.log(`  Found ${allEntries.length} events`);
 
   // 2. Ensure all projects exist
@@ -266,6 +273,7 @@ async function backfill() {
   // 5. Sync daily metrics from stats-cache.json
   console.log("  Syncing daily metrics...");
   const statsCache = readStatsCache();
+  cachedModelStats = readModelStats();
   if (statsCache) {
     const synced = await syncDailyMetrics(statsCache);
     console.log(`  Synced ${synced} daily metric rows`);
@@ -281,7 +289,7 @@ async function backfill() {
 
   // 7. Update facility status
   console.log("  Updating facility status...");
-  await syncFacilityStatus();
+  await syncFacilityStatus(statsCache, cachedModelStats);
 
   console.log("Backfill complete.\n");
 }
@@ -290,6 +298,7 @@ async function backfill() {
 
 async function incrementalSync() {
   const newEntries = tailer.poll();
+  if (newEntries.length > 0) allSeenEntries.push(...newEntries);
 
   if (newEntries.length > 0) {
     // Ensure projects exist
@@ -319,16 +328,19 @@ async function incrementalSync() {
   }
 
   // Always update facility status (live processes change independently)
-  await syncFacilityStatus();
+  const statsCache = readStatsCache();
+  // Only re-read model-stats from disk when new events arrived
+  if (newEntries.length > 0) cachedModelStats = readModelStats();
+  return syncFacilityStatus(statsCache, cachedModelStats);
 }
 
 // ─── Facility status sync ──────────────────────────────────────────────────
 
-async function syncFacilityStatus() {
+async function syncFacilityStatus(
+  statsCache: ReturnType<typeof readStatsCache>,
+  modelStats: ReturnType<typeof readModelStats>
+) {
   const facility = getFacilityState();
-  const statsCache = readStatsCache();
-  const modelStats = readModelStats();
-  const tokenStats = readTokenStats();
 
   // Compute per-project agent breakdown (keyed by slug)
   const agentsByProject: Record<string, { count: number; active: number }> = {};
@@ -346,7 +358,7 @@ async function syncFacilityStatus() {
     activeAgents: facility.activeAgents,
     activeProjects: facility.activeProjects,
     tokensLifetime: computeLifetimeTokens(statsCache),
-    tokensToday: computeTodayTokens(),
+    tokensToday: computeTodayTokens(statsCache),
     sessionsLifetime: statsCache?.totalSessions ?? 0,
     messagesLifetime: statsCache?.totalMessages ?? 0,
     modelStats: Object.fromEntries(
@@ -368,17 +380,20 @@ async function syncFacilityStatus() {
   };
 
   await updateFacilityStatus(update);
+
+  return facility;
 }
 
 // ─── Periodic daily metrics sync ───────────────────────────────────────────
 
 let lastDailySync = "";
 
-async function maybeSyncDailyMetrics() {
+async function maybeSyncDailyMetrics(
+  statsCache: ReturnType<typeof readStatsCache>
+) {
   const today = new Date().toISOString().split("T")[0];
   if (today === lastDailySync) return; // Already synced today's data this cycle
 
-  const statsCache = readStatsCache();
   if (statsCache) {
     await syncDailyMetrics(statsCache);
     lastDailySync = today;
@@ -397,9 +412,7 @@ async function maybeSyncProjectDailyMetrics() {
   try {
     const projectTokenMap = scanProjectTokens();
     cachedTokensByProject = computeTokensByProject(projectTokenMap);
-    const aggregationTailer = new LogTailer();
-    const allEntries = aggregationTailer.readAll();
-    const projectEventAggregates = aggregateProjectEvents(allEntries);
+    const projectEventAggregates = aggregateProjectEvents(allSeenEntries);
     await syncProjectDailyMetrics(projectTokenMap, projectEventAggregates);
     lastProjectSync = today;
   } catch (err) {
@@ -455,15 +468,20 @@ async function main() {
   let cycleCount = 0;
 
   while (true) {
+    let facility: ReturnType<typeof getFacilityState> | undefined;
     try {
-      await incrementalSync();
+      facility = await incrementalSync();
 
       // Refresh slug map + sync daily metrics + prune every ~10 cycles
       if (cycleCount % 10 === 0) {
+        const statsCache = readStatsCache();
+        // refreshSlugMap must run first — others depend on the slug map
         await refreshSlugMap();
-        await maybeSyncDailyMetrics();
-        await maybeSyncProjectDailyMetrics();
-        await maybePruneEvents();
+        await Promise.all([
+          maybeSyncDailyMetrics(statsCache),
+          maybeSyncProjectDailyMetrics(),
+          maybePruneEvents(),
+        ]);
       }
       cycleCount++;
     } catch (err) {
@@ -471,7 +489,8 @@ async function main() {
     }
 
     // Adaptive sleep: shorter when active, longer when dormant
-    const facility = getFacilityState();
+    // Reuse facility state from syncFacilityStatus to avoid duplicate ps/lsof
+    if (!facility) facility = getFacilityState();
     const sleepMs = facility.status === "active" ? PUSH_ACTIVE : PUSH_DORMANT;
     await Bun.sleep(sleepMs);
   }

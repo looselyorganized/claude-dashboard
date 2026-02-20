@@ -82,7 +82,3 @@ export function getVisibility(projectName: string): "public" | "classified" {
   return visibility;
 }
 
-/** Get all cached visibilities. */
-export function getAllVisibilities(): Record<string, "public" | "classified"> {
-  return { ...cache };
-}

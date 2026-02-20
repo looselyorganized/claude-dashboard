@@ -4,10 +4,12 @@
  */
 
 import { execSync } from "child_process";
-import { resolve } from "path";
+import { existsSync } from "fs";
+import { dirname, basename, join } from "path";
+import { homedir } from "os";
 import { resolveSlug } from "./slug-resolver";
 
-const PROJECT_ROOT = "/Users/bigviking/Documents/github/projects";
+const PROJECT_ROOT = "/Users/bigviking/Documents/github/projects/looselyorganized";
 
 export interface ClaudeProcess {
   pid: number;
@@ -21,18 +23,35 @@ export interface ClaudeProcess {
   model: string;
 }
 
+const projectNameCache = new Map<string, string>();
+
 /**
- * Derive project name from working directory.
- * Looks for a "projects" parent directory, otherwise uses basename.
+ * Derive project name from working directory by finding nearest git root.
+ * Falls back to "projects/" heuristic, then basename.
  */
 export function deriveProjectName(cwd: string): string {
   if (!cwd || cwd === "/") return "unknown";
+  if (projectNameCache.has(cwd)) return projectNameCache.get(cwd)!;
+  const home = homedir();
+  let current = cwd;
+  while (current !== home && current !== dirname(current)) {
+    if (existsSync(join(current, ".git"))) {
+      const name = basename(current);
+      projectNameCache.set(cwd, name);
+      return name;
+    }
+    current = dirname(current);
+  }
   const parts = cwd.split("/");
   const idx = parts.indexOf("projects");
   if (idx !== -1 && idx + 1 < parts.length) {
-    return parts[idx + 1];
+    const result = parts[idx + 1];
+    projectNameCache.set(cwd, result);
+    return result;
   }
-  return parts[parts.length - 1] || "unknown";
+  const result = basename(cwd) || "unknown";
+  projectNameCache.set(cwd, result);
+  return result;
 }
 
 /**

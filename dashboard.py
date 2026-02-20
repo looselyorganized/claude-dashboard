@@ -15,7 +15,6 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
-from textual.timer import Timer
 from textual.widgets import Footer, Input, RichLog, Static, TabbedContent, TabPane
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
@@ -634,18 +633,13 @@ def build_agent_tree(entries: list[LogEntry]) -> list[SessionNode]:
     return sessions
 
 
-def _count_active_sessions(sessions: list[SessionNode]) -> int:
-    """Count sessions that are currently active."""
-    return sum(1 for s in sessions if s.is_active)
-
-
 def _build_active_session_map(sessions: list[SessionNode]) -> dict[str, SessionNode]:
     """Build a lookup from normalized project key to the active session."""
-    session_map: dict[str, SessionNode] = {}
-    for sess in sessions:
-        if sess.is_active:
-            session_map[_normalize_project_key(sess.project)] = sess
-    return session_map
+    return {
+        _normalize_project_key(sess.project): sess
+        for sess in sessions
+        if sess.is_active
+    }
 
 
 # ─── Process scanner ─────────────────────────────────────────────────────────
@@ -692,21 +686,38 @@ def _format_uptime(etime: str) -> str:
     return f"{minutes}m"
 
 
+_PROJECT_NAME_CACHE: dict[str, str] = {}
+
+
 def _derive_project_name(cwd: str) -> str:
-    """Derive a display-friendly project name from the CWD path."""
+    """Derive project name from CWD by finding nearest git root."""
+    if cwd in _PROJECT_NAME_CACHE:
+        return _PROJECT_NAME_CACHE[cwd]
     if not cwd or cwd == "/":
         return "unknown"
     p = Path(cwd)
-    # If inside a monorepo subdir (e.g. .../nexus-2/apps/cli), use parent project name
-    # Heuristic: if grandparent is 'projects', use parent name
+    # Strategy 1: Find nearest .git root
+    current = p
+    home = Path.home()
+    while current != home and current != current.parent:
+        if (current / ".git").exists():
+            result = current.name
+            _PROJECT_NAME_CACHE[cwd] = result
+            return result
+        current = current.parent
+    # Strategy 2: Fallback — first dir after "projects/"
     parts = p.parts
     try:
         idx = parts.index("projects")
         if idx + 1 < len(parts):
-            return parts[idx + 1]
+            result = parts[idx + 1]
+            _PROJECT_NAME_CACHE[cwd] = result
+            return result
     except ValueError:
         pass
-    return p.name
+    result = p.name
+    _PROJECT_NAME_CACHE[cwd] = result
+    return result
 
 
 class ProcessScanner:
@@ -1169,23 +1180,22 @@ class ClaudeDashboardApp(App):
 
     # ─── Tab switching ─────────────────────────────────────────────────────
 
-    def action_switch_tab(self, tab_id: str) -> None:
-        """Switch to a specific tab by ID."""
-        tabs = self.query_one("#tabs", TabbedContent)
-        tabs.active = tab_id
+    def _activate_tab(self, tab_id: str) -> None:
+        """Set the active tab and refresh its content if needed."""
         self._active_tab = tab_id
         if tab_id == "tab-stats":
             self._refresh_stats_tab()
         elif tab_id == "tab-instances":
             self._refresh_instances_tab()
 
+    def action_switch_tab(self, tab_id: str) -> None:
+        """Switch to a specific tab by ID."""
+        self.query_one("#tabs", TabbedContent).active = tab_id
+        self._activate_tab(tab_id)
+
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         """Track active tab when user clicks tab headers."""
-        self._active_tab = event.pane.id or ""
-        if self._active_tab == "tab-stats":
-            self._refresh_stats_tab()
-        elif self._active_tab == "tab-instances":
-            self._refresh_instances_tab()
+        self._activate_tab(event.pane.id or "")
 
     def _is_live_tab(self) -> bool:
         return self._active_tab == "tab-live"
@@ -1243,14 +1253,10 @@ class ClaudeDashboardApp(App):
         if self.compact_mode:
             filtered = self._compact_entries(filtered)
 
-        prev_entry = None
-        for entry in filtered:
-            if isinstance(entry, LogEntry) and "🟢" in entry.event and "Session started" in entry.event:
-                if prev_entry is not None:
-                    sep = Text("─" * 60, style="dim")
-                    log_widget.write(sep)
+        for idx, entry in enumerate(filtered):
+            if idx > 0 and isinstance(entry, LogEntry) and "🟢" in entry.event and "Session started" in entry.event:
+                log_widget.write(Text("─" * 60, style="dim"))
             self._write_entry(log_widget, entry)
-            prev_entry = entry
 
         if self.live_tail:
             log_widget.scroll_end(animate=False)
@@ -1298,6 +1304,12 @@ class ClaudeDashboardApp(App):
         """Collapse consecutive same-type events."""
         if not entries:
             return []
+
+        def flush_run(run: list[LogEntry]):
+            if len(run) > 1:
+                return {"sample": run[0], "count": len(run)}
+            return run[0]
+
         result = []
         run_emoji = entries[0].emoji
         run_project = entries[0].project
@@ -1307,19 +1319,12 @@ class ClaudeDashboardApp(App):
             if entry.emoji == run_emoji and entry.project == run_project and run_emoji:
                 run_entries.append(entry)
             else:
-                if len(run_entries) > 1:
-                    result.append({"sample": run_entries[0], "count": len(run_entries)})
-                else:
-                    result.append(run_entries[0])
+                result.append(flush_run(run_entries))
                 run_emoji = entry.emoji
                 run_project = entry.project
                 run_entries = [entry]
 
-        if len(run_entries) > 1:
-            result.append({"sample": run_entries[0], "count": len(run_entries)})
-        else:
-            result.append(run_entries[0])
-
+        result.append(flush_run(run_entries))
         return result
 
     # ─── Sidebar ──────────────────────────────────────────────────────────
@@ -1697,26 +1702,26 @@ class ClaudeDashboardApp(App):
             ver = Text(inst.claude_version or "-", style="dim")
 
             # Info column: MCP count, shell, caffeinate badges
-            info = Text()
+            info_parts: list[tuple[str, str]] = []
             if inst.mcp_server_count > 0:
-                info.append(f"{inst.mcp_server_count} MCP", style="#af87ff")
+                info_parts.append((f"{inst.mcp_server_count} MCP", "#af87ff"))
             if inst.has_shell:
-                if len(info) > 0:
-                    info.append("  ", style="")
                 cmd_label = inst.shell_command or "cmd"
-                info.append(f"{spinner} {cmd_label}", style="bold #d7af5f")
+                info_parts.append((f"{spinner} {cmd_label}", "bold #d7af5f"))
             if inst.has_caffeinate:
-                if len(info) > 0:
-                    info.append("  ", style="")
-                info.append("☕", style="#87d787")
+                info_parts.append(("☕", "#87d787"))
 
             # Match with event log for model info
             norm_key = _normalize_project_key(inst.project_name)
             session = session_map.get(norm_key)
             if session and session.model:
-                if len(info) > 0:
-                    info.append("  ", style="")
-                info.append(format_model_name(session.model), style="dim")
+                info_parts.append((format_model_name(session.model), "dim"))
+
+            info = Text()
+            for i, (label, style) in enumerate(info_parts):
+                if i > 0:
+                    info.append("  ")
+                info.append(label, style=style)
 
             # Directory (shortened)
             cwd = inst.cwd.replace(str(Path.home()), "~")
@@ -1747,12 +1752,8 @@ class ClaudeDashboardApp(App):
     # ─── Project discovery ────────────────────────────────────────────────
 
     def _discover_projects(self) -> None:
-        seen = set()
-        for entry in self.tailer.all_entries:
-            if entry.project:
-                seen.add(entry.project)
-        for proj in self._project_token_scanner.all_projects():
-            seen.add(proj)
+        seen = {e.project for e in self.tailer.all_entries if e.project}
+        seen.update(self._project_token_scanner.all_projects())
         self._projects = sorted(seen)
 
     # ─── Filter indicators ────────────────────────────────────────────────
@@ -1773,7 +1774,7 @@ class ClaudeDashboardApp(App):
             start = (datetime.now() - timedelta(days=6)).strftime("%m/%d")
             end = datetime.now().strftime("%m/%d")
             return f"7d ({start}–{end})"
-        if rng == "All":
+        else:
             first_date = self._stats_cache.get("firstSessionDate", "")
             if first_date:
                 try:
@@ -1782,7 +1783,6 @@ class ClaudeDashboardApp(App):
                 except Exception:
                     pass
             return "All time"
-        return rng
 
     def _update_filter_indicators(self) -> None:
         filters = []
@@ -2178,7 +2178,7 @@ class ClaudeDashboardApp(App):
     def action_cycle_project(self) -> None:
         """Cycle project filter: All → proj1 → proj2 → ... → All."""
         if self._is_live_tab() and self.query_one("#filter-input", Input).has_focus:
-            return
+            return  # skip when typing in filter, but allow from Stats tab
         if not self._projects:
             return
         self._project_idx = (self._project_idx + 1) % (len(self._projects) + 1)
@@ -2194,9 +2194,7 @@ class ClaudeDashboardApp(App):
 
     def action_cycle_event_type(self) -> None:
         """Cycle event type filter: All → tools → reads → ... → All (Tab 1 only)."""
-        if not self._is_live_tab():
-            return
-        if self.query_one("#filter-input", Input).has_focus:
+        if self._should_ignore_live_action():
             return
         self._event_type_idx = (self._event_type_idx + 1) % (len(self._event_types) + 1)
         if self._event_type_idx == 0:
@@ -2207,9 +2205,7 @@ class ClaudeDashboardApp(App):
 
     def action_toggle_compact(self) -> None:
         """Toggle compact mode (Tab 1 only)."""
-        if not self._is_live_tab():
-            return
-        if self.query_one("#filter-input", Input).has_focus:
+        if self._should_ignore_live_action():
             return
         self.compact_mode = not self.compact_mode
         self._rebuild_log()
@@ -2231,38 +2227,37 @@ class ClaudeDashboardApp(App):
         if self._is_stats_tab():
             self._refresh_stats_tab()
 
+    def _should_ignore_live_action(self) -> bool:
+        """Check if a live-tab keyboard action should be ignored.
+
+        Returns True when not on the Live tab or the filter input has focus.
+        """
+        return not self._is_live_tab() or self.query_one("#filter-input", Input).has_focus
+
     def action_scroll_down(self) -> None:
         """Scroll log down, disable live tail (Tab 1 only)."""
-        if not self._is_live_tab():
-            return
-        if self.query_one("#filter-input", Input).has_focus:
+        if self._should_ignore_live_action():
             return
         self.live_tail = False
         self.query_one("#event-log", RichLog).scroll_down(animate=False)
 
     def action_scroll_up(self) -> None:
         """Scroll log up, disable live tail (Tab 1 only)."""
-        if not self._is_live_tab():
-            return
-        if self.query_one("#filter-input", Input).has_focus:
+        if self._should_ignore_live_action():
             return
         self.live_tail = False
         self.query_one("#event-log", RichLog).scroll_up(animate=False)
 
     def action_scroll_end(self) -> None:
         """Jump to bottom, resume live tail (Tab 1 only)."""
-        if not self._is_live_tab():
-            return
-        if self.query_one("#filter-input", Input).has_focus:
+        if self._should_ignore_live_action():
             return
         self.live_tail = True
         self.query_one("#event-log", RichLog).scroll_end(animate=False)
 
     def action_scroll_home(self) -> None:
         """Jump to top (Tab 1 only)."""
-        if not self._is_live_tab():
-            return
-        if self.query_one("#filter-input", Input).has_focus:
+        if self._should_ignore_live_action():
             return
         self.live_tail = False
         self.query_one("#event-log", RichLog).scroll_home(animate=False)

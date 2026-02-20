@@ -5,7 +5,6 @@
 
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { LogEntry, StatsCache } from "./parsers";
-import type { ModelStats } from "./parsers";
 import type { ProjectTokenMap } from "./project-scanner";
 
 let supabase: SupabaseClient;
@@ -34,33 +33,45 @@ export async function upsertProject(
   timestamp?: Date
 ) {
   const now = timestamp ?? new Date();
-  const { error } = await supabase.from("projects").upsert(
-    {
-      content_slug: slug,
-      visibility,
-      first_seen: now.toISOString(),
-      last_active: now.toISOString(),
-    },
-    { onConflict: "content_slug", ignoreDuplicates: false }
-  );
+  const { data, error } = await supabase
+    .from("projects")
+    .upsert(
+      {
+        content_slug: slug,
+        visibility,
+        first_seen: now.toISOString(),
+        last_active: now.toISOString(),
+      },
+      { onConflict: "content_slug", ignoreDuplicates: false }
+    )
+    .select("local_names")
+    .single();
 
   if (error) {
     // If upsert fails because first_seen shouldn't change, just update last_active
-    await supabase
+    // and fetch local_names in the same step
+    const { data: fallback } = await supabase
       .from("projects")
       .update({ last_active: now.toISOString(), visibility })
-      .eq("content_slug", slug);
-  }
-
-  // Ensure localName is in the local_names array
-  if (localName && localName !== slug) {
-    const { data: existing } = await supabase
-      .from("projects")
-      .select("local_names")
       .eq("content_slug", slug)
+      .select("local_names")
       .single();
 
-    const currentNames: string[] = (existing?.local_names as string[]) ?? [];
+    if (localName && localName !== slug && fallback) {
+      const currentNames: string[] = (fallback.local_names as string[]) ?? [];
+      if (!currentNames.includes(localName)) {
+        await supabase
+          .from("projects")
+          .update({ local_names: [...currentNames, localName] })
+          .eq("content_slug", slug);
+      }
+    }
+    return;
+  }
+
+  // Merge localName into local_names using the data from the upsert response
+  if (localName && localName !== slug && data) {
+    const currentNames: string[] = (data.local_names as string[]) ?? [];
     if (!currentNames.includes(localName)) {
       await supabase
         .from("projects")
@@ -160,7 +171,7 @@ export type ProjectEventAggregates = Map<
  * Sync global daily metrics from stats-cache.json.
  */
 export async function syncDailyMetrics(statsCache: StatsCache) {
-  if (!statsCache.dailyActivity) return;
+  if (!statsCache.dailyActivity) return 0;
 
   // Build a map of token data by date
   const tokensByDate: Record<string, Record<string, number>> = {};
@@ -170,41 +181,67 @@ export async function syncDailyMetrics(statsCache: StatsCache) {
 
   const rows = statsCache.dailyActivity.map((day) => ({
     date: day.date,
-    project: null, // NULL = global aggregate
+    project: null as string | null, // NULL = global aggregate
     messages: day.messageCount,
     sessions: day.sessionCount,
     tool_calls: day.toolCallCount,
     tokens: tokensByDate[day.date] ?? null,
   }));
 
-  // Upsert each row individually to handle the COALESCE unique index
-  let synced = 0;
-  for (const row of rows) {
-    // Check if exists
-    const { data: existing } = await supabase
-      .from("daily_metrics")
-      .select("id")
-      .eq("date", row.date)
-      .is("project", null)
-      .maybeSingle();
+  if (rows.length === 0) return 0;
 
-    if (existing) {
-      await supabase
-        .from("daily_metrics")
-        .update({
+  // Batch fetch all existing global daily_metrics rows
+  const dates = rows.map((r) => r.date);
+  const { data: existingRows } = await supabase
+    .from("daily_metrics")
+    .select("id, date")
+    .in("date", dates)
+    .is("project", null);
+
+  const existingByDate = new Map<string, number>();
+  for (const row of existingRows ?? []) {
+    existingByDate.set(row.date, row.id);
+  }
+
+  // Split into updates vs inserts
+  const toInsert: typeof rows = [];
+  const toUpdate: Array<{ id: number; data: Omit<typeof rows[0], "date" | "project"> }> = [];
+
+  for (const row of rows) {
+    const existingId = existingByDate.get(row.date);
+    if (existingId) {
+      toUpdate.push({
+        id: existingId,
+        data: {
           messages: row.messages,
           sessions: row.sessions,
           tool_calls: row.tool_calls,
           tokens: row.tokens,
-        })
-        .eq("id", existing.id);
+        },
+      });
     } else {
-      await supabase.from("daily_metrics").insert(row);
+      toInsert.push(row);
     }
-    synced++;
   }
 
-  return synced;
+  // Bulk insert new rows
+  if (toInsert.length > 0) {
+    await supabase.from("daily_metrics").insert(toInsert);
+  }
+
+  // Batch update existing rows (Supabase doesn't support bulk update by different IDs,
+  // so we batch these into reasonable chunks to limit sequential calls)
+  const UPDATE_BATCH = 50;
+  for (let i = 0; i < toUpdate.length; i += UPDATE_BATCH) {
+    const batch = toUpdate.slice(i, i + UPDATE_BATCH);
+    await Promise.all(
+      batch.map((u) =>
+        supabase.from("daily_metrics").update(u.data).eq("id", u.id)
+      )
+    );
+  }
+
+  return rows.length;
 }
 
 /**
@@ -215,9 +252,6 @@ export async function syncProjectDailyMetrics(
   tokenMap: ProjectTokenMap,
   eventAggregates?: ProjectEventAggregates
 ) {
-  let synced = 0;
-  let errors = 0;
-
   // Build a unified set of (project, date) keys from both sources
   const keys = new Map<string, { tokens?: Record<string, number>; events?: { sessions: number; messages: number; toolCalls: number; agentSpawns: number } }>();
 
@@ -240,65 +274,86 @@ export async function syncProjectDailyMetrics(
     }
   }
 
-  // Process all rows
   const allRows = [...keys.entries()].map(([k, v]) => {
     const [project, date] = k.split("\0");
     return { project, date, ...v };
   });
 
-  const BATCH_SIZE = 500;
-  for (let i = 0; i < allRows.length; i += BATCH_SIZE) {
-    const batch = allRows.slice(i, i + BATCH_SIZE);
+  if (allRows.length === 0) return 0;
 
-    for (const row of batch) {
-      try {
-        const { data: existing } = await supabase
-          .from("daily_metrics")
-          .select("id, tokens, sessions, messages, tool_calls, agent_spawns")
-          .eq("date", row.date)
-          .eq("project", row.project)
-          .maybeSingle();
+  // Batch fetch all existing per-project daily_metrics rows
+  const projects = [...new Set(allRows.map((r) => r.project))];
+  const dates = [...new Set(allRows.map((r) => r.date))];
 
-        if (existing) {
-          // Only update fields we have new data for — don't overwrite with null
-          const updates: Record<string, any> = {};
-          if (row.tokens) updates.tokens = row.tokens;
-          if (row.events) {
-            updates.sessions = row.events.sessions;
-            updates.messages = row.events.messages;
-            updates.tool_calls = row.events.toolCalls;
-            updates.agent_spawns = row.events.agentSpawns;
-          }
-          if (Object.keys(updates).length > 0) {
-            await supabase
-              .from("daily_metrics")
-              .update(updates)
-              .eq("id", existing.id);
-          }
-        } else {
-          await supabase.from("daily_metrics").insert({
-            date: row.date,
-            project: row.project,
-            tokens: row.tokens ?? null,
-            sessions: row.events?.sessions ?? null,
-            messages: row.events?.messages ?? null,
-            tool_calls: row.events?.toolCalls ?? null,
-            agent_spawns: row.events?.agentSpawns ?? null,
-          });
-        }
-        synced++;
-      } catch (err) {
-        console.error(`  Error syncing project metric ${row.project}/${row.date}:`, err);
-        errors++;
-      }
+  // Fetch in chunks to stay within Supabase query limits
+  const existingByKey = new Map<string, { id: number }>();
+  const FETCH_BATCH = 500;
+  for (let i = 0; i < projects.length; i += FETCH_BATCH) {
+    const projectBatch = projects.slice(i, i + FETCH_BATCH);
+    const { data: existingRows } = await supabase
+      .from("daily_metrics")
+      .select("id, date, project")
+      .in("project", projectBatch)
+      .in("date", dates);
+
+    for (const row of existingRows ?? []) {
+      existingByKey.set(makeKey(row.project, row.date), { id: row.id });
     }
   }
 
-  if (errors > 0) {
-    console.error(`  ${errors} errors during project daily metrics sync`);
+  // Split into updates vs inserts
+  const toInsert: Array<Record<string, any>> = [];
+  const toUpdate: Array<{ id: number; data: Record<string, any> }> = [];
+
+  for (const row of allRows) {
+    const existing = existingByKey.get(makeKey(row.project, row.date));
+    if (existing) {
+      const updates: Record<string, any> = {};
+      if (row.tokens) updates.tokens = row.tokens;
+      if (row.events) {
+        updates.sessions = row.events.sessions;
+        updates.messages = row.events.messages;
+        updates.tool_calls = row.events.toolCalls;
+        updates.agent_spawns = row.events.agentSpawns;
+      }
+      if (Object.keys(updates).length > 0) {
+        toUpdate.push({ id: existing.id, data: updates });
+      }
+    } else {
+      toInsert.push({
+        date: row.date,
+        project: row.project,
+        tokens: row.tokens ?? null,
+        sessions: row.events?.sessions ?? null,
+        messages: row.events?.messages ?? null,
+        tool_calls: row.events?.toolCalls ?? null,
+        agent_spawns: row.events?.agentSpawns ?? null,
+      });
+    }
   }
 
-  return synced;
+  // Bulk insert new rows in batches
+  const INSERT_BATCH = 500;
+  for (let i = 0; i < toInsert.length; i += INSERT_BATCH) {
+    const batch = toInsert.slice(i, i + INSERT_BATCH);
+    const { error } = await supabase.from("daily_metrics").insert(batch);
+    if (error) {
+      console.error(`  Error bulk inserting project metrics:`, error.message);
+    }
+  }
+
+  // Batch update existing rows with concurrent requests
+  const UPDATE_BATCH = 50;
+  for (let i = 0; i < toUpdate.length; i += UPDATE_BATCH) {
+    const batch = toUpdate.slice(i, i + UPDATE_BATCH);
+    await Promise.all(
+      batch.map((u) =>
+        supabase.from("daily_metrics").update(u.data).eq("id", u.id)
+      )
+    );
+  }
+
+  return allRows.length;
 }
 
 // ─── Facility Status ───────────────────────────────────────────────────────

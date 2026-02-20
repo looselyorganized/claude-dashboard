@@ -9,7 +9,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "fs";
 import { basename, join } from "path";
 
-const PROJECT_ROOT = "/Users/bigviking/Documents/github/projects";
+const PROJECT_ROOT = "/Users/bigviking/Documents/github/projects/looselyorganized";
 
 const cache = new Map<string, string | null>();
 
@@ -96,14 +96,6 @@ export function buildSlugMap(): Map<string, string> {
   }
 
   return map;
-}
-
-/**
- * Check if a directory name belongs to a LORF project.
- */
-export function isLorfProject(dirName: string): boolean {
-  const slug = resolveSlug(join(PROJECT_ROOT, dirName));
-  return slug !== null;
 }
 
 /**

@@ -33,7 +33,7 @@ function decodeDirName(dirName: string): string {
 
 // ─── Filesystem-aware project name resolution ───────────────────────────────
 
-const PROJECT_ROOT = "/Users/bigviking/Documents/github/projects";
+const PROJECT_ROOT = "/Users/bigviking/Documents/github/projects/looselyorganized";
 
 let cachedProjectDirs: string[] | null = null;
 

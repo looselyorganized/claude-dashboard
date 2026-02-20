@@ -11,7 +11,6 @@ import { join } from "path";
 
 const CLAUDE_DIR = join(homedir(), ".claude");
 export const LOG_FILE = join(CLAUDE_DIR, "events.log");
-export const TOKEN_FILE = join(CLAUDE_DIR, "token-stats");
 export const MODEL_FILE = join(CLAUDE_DIR, "model-stats");
 export const STATS_CACHE_FILE = join(CLAUDE_DIR, "stats-cache.json");
 
@@ -215,36 +214,6 @@ export class LogTailer {
     }
     return entries;
   }
-}
-
-// ─── Token stats reader ────────────────────────────────────────────────────
-
-export interface TokenStats {
-  input: number;
-  cacheWrite: number;
-  cacheRead: number;
-  output: number;
-  total: number;
-}
-
-export function readTokenStats(): TokenStats | null {
-  try {
-    const parts = readFileSync(TOKEN_FILE, "utf-8").trim().split(/\s+/);
-    if (parts.length >= 4) {
-      const input = parseInt(parts[0]);
-      const cacheWrite = parseInt(parts[1]);
-      const cacheRead = parseInt(parts[2]);
-      const output = parseInt(parts[3]);
-      return {
-        input,
-        cacheWrite,
-        cacheRead,
-        output,
-        total: input + cacheWrite + cacheRead + output,
-      };
-    }
-  } catch {}
-  return null;
 }
 
 // ─── Model stats reader ────────────────────────────────────────────────────
