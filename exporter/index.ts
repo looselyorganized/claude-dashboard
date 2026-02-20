@@ -114,17 +114,19 @@ async function refreshSlugMap() {
   saveSlugMapping(current);
 }
 
-/** Map a directory name (from events.log) to its content_slug */
-function toSlug(dirName: string): string {
-  return slugMap.get(dirName) ?? dirName;
+/** Map a directory name (from events.log) to its content_slug, or null if not a LORF project */
+function toSlug(dirName: string): string | null {
+  return slugMap.get(dirName) ?? null;
 }
 
-/** Map all entry.project fields from dir names to slugs */
-function mapEntriesToSlugs(entries: LogEntry[]): LogEntry[] {
-  return entries.map((e) => ({
-    ...e,
-    project: e.project ? toSlug(e.project) : e.project,
-  }));
+/** Filter entries to only LORF projects and map project fields to slugs */
+function filterAndMapEntries(entries: LogEntry[]): LogEntry[] {
+  return entries
+    .filter((e) => e.project && toSlug(e.project) !== null)
+    .map((e) => ({
+      ...e,
+      project: toSlug(e.project)!,
+    }));
 }
 
 // Cache project token totals for facility status updates
@@ -139,6 +141,7 @@ async function ensureProjects(entries: LogEntry[]) {
   for (const entry of entries) {
     if (!entry.project) continue;
     const slug = toSlug(entry.project);
+    if (!slug) continue; // Not a LORF project — skip
     if (!knownProjects.has(slug)) {
       newSlugs.add(slug);
       slugToLocalName.set(slug, entry.project);
@@ -199,6 +202,7 @@ function aggregateProjectEvents(entries: LogEntry[]): ProjectEventAggregates {
     if (!entry.project || !entry.parsedTimestamp) continue;
 
     const slug = toSlug(entry.project);
+    if (!slug) continue; // Not a LORF project
     const date = entry.parsedTimestamp.toISOString().split("T")[0];
 
     let dateMap = agg.get(slug);
@@ -241,27 +245,20 @@ async function backfill() {
 
   // 3. Insert events in batches (with project mapped to slug)
   console.log("  Inserting events...");
-  const mappedEntries = mapEntriesToSlugs(allEntries);
-  const { inserted, errors, insertedByProject } = await insertEvents(mappedEntries);
+  const lorfEntries = filterAndMapEntries(allEntries);
+  const { inserted, errors, insertedByProject } = await insertEvents(lorfEntries);
   console.log(`  Inserted: ${inserted}, Errors: ${errors}`);
 
-  // 4. Update project activity counts (using actually-inserted counts, mapped to slugs)
+  // 4. Update project activity counts (insertedByProject keys are already slugs from lorfEntries)
   console.log("  Updating project activity...");
   const slugLastActive: Record<string, Date> = {};
-  for (const entry of allEntries) {
+  for (const entry of lorfEntries) {
     if (!entry.project || !entry.parsedTimestamp) continue;
-    const slug = toSlug(entry.project);
-    if (!slugLastActive[slug] || entry.parsedTimestamp > slugLastActive[slug]) {
-      slugLastActive[slug] = entry.parsedTimestamp;
+    if (!slugLastActive[entry.project] || entry.parsedTimestamp > slugLastActive[entry.project]) {
+      slugLastActive[entry.project] = entry.parsedTimestamp;
     }
   }
-  // Aggregate inserted counts by slug (insertedByProject keys are dir names)
-  const insertedBySlug: Record<string, number> = {};
-  for (const [dirName, count] of Object.entries(insertedByProject)) {
-    const slug = toSlug(dirName);
-    insertedBySlug[slug] = (insertedBySlug[slug] ?? 0) + count;
-  }
-  for (const [slug, count] of Object.entries(insertedBySlug)) {
+  for (const [slug, count] of Object.entries(insertedByProject)) {
     const lastActive = slugLastActive[slug] ?? new Date();
     await updateProjectActivity(slug, count, lastActive);
   }
@@ -298,30 +295,24 @@ async function incrementalSync() {
     // Ensure projects exist
     await ensureProjects(newEntries);
 
-    // Insert new events (with project mapped to slug)
-    const mappedEntries = mapEntriesToSlugs(newEntries);
-    const { inserted, errors, insertedByProject } = await insertEvents(mappedEntries);
+    // Insert new events (only LORF projects, mapped to slug)
+    const lorfEntries = filterAndMapEntries(newEntries);
+    const { inserted, errors, insertedByProject } = await insertEvents(lorfEntries);
     if (inserted > 0 || errors > 0) {
       console.log(
         `  ${new Date().toLocaleTimeString()} — ${inserted} events synced${errors > 0 ? `, ${errors} errors` : ""}`
       );
     }
 
-    // Update project activity (using actually-inserted counts, mapped to slugs)
+    // Update project activity (insertedByProject keys are already slugs from lorfEntries)
     const slugLastActive: Record<string, Date> = {};
-    for (const entry of newEntries) {
+    for (const entry of lorfEntries) {
       if (!entry.project || !entry.parsedTimestamp) continue;
-      const slug = toSlug(entry.project);
-      if (!slugLastActive[slug] || entry.parsedTimestamp > slugLastActive[slug]) {
-        slugLastActive[slug] = entry.parsedTimestamp;
+      if (!slugLastActive[entry.project] || entry.parsedTimestamp > slugLastActive[entry.project]) {
+        slugLastActive[entry.project] = entry.parsedTimestamp;
       }
     }
-    const insertedBySlug: Record<string, number> = {};
-    for (const [dirName, count] of Object.entries(insertedByProject)) {
-      const slug = toSlug(dirName);
-      insertedBySlug[slug] = (insertedBySlug[slug] ?? 0) + count;
-    }
-    for (const [slug, count] of Object.entries(insertedBySlug)) {
+    for (const [slug, count] of Object.entries(insertedByProject)) {
       const lastActive = slugLastActive[slug] ?? new Date();
       await updateProjectActivity(slug, count, lastActive);
     }

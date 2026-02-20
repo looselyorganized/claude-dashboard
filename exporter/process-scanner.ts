@@ -42,7 +42,7 @@ export function deriveProjectName(cwd: string): string {
 export function deriveSlug(cwd: string): string {
   const dirName = deriveProjectName(cwd);
   if (dirName === "unknown") return "unknown";
-  return resolveSlug(`${PROJECT_ROOT}/${dirName}`);
+  return resolveSlug(`${PROJECT_ROOT}/${dirName}`) ?? "unknown";
 }
 
 /**

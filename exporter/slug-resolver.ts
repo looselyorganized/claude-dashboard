@@ -2,16 +2,16 @@
  * Slug resolver for the LORF telemetry exporter.
  *
  * Maps project directory paths to their content_slug by reading
- * .lorf/project.md frontmatter. Falls back to directory basename
- * when no .lorf/ exists.
+ * .lorf/project.md frontmatter. Only LORF projects (those with .lorf/)
+ * are tracked — all others are silently ignored.
  */
 
-import { readdirSync, readFileSync, statSync } from "fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "fs";
 import { basename, join } from "path";
 
 const PROJECT_ROOT = "/Users/bigviking/Documents/github/projects";
 
-const cache = new Map<string, string>();
+const cache = new Map<string, string | null>();
 
 /**
  * Minimal YAML frontmatter parser.
@@ -34,26 +34,34 @@ function parseFrontmatter(content: string): Record<string, string> {
 
 /**
  * Resolve a project directory path to its content_slug.
+ * Returns null if the project is not a LORF project (no .lorf/ directory).
  *
  * 1. Check in-memory cache
- * 2. Try reading {projectDir}/.lorf/project.md
- * 3. Parse YAML frontmatter
- * 4. Return content_slug ?? slug ?? basename(projectDir)
- * 5. Cache result
+ * 2. Check for .lorf/ directory existence
+ * 3. Try reading {projectDir}/.lorf/project.md
+ * 4. Parse YAML frontmatter
+ * 5. Return content_slug ?? slug ?? basename(projectDir)
+ * 6. Cache result
  */
-export function resolveSlug(projectDir: string): string {
-  const cached = cache.get(projectDir);
-  if (cached) return cached;
+export function resolveSlug(projectDir: string): string | null {
+  if (cache.has(projectDir)) return cache.get(projectDir)!;
+
+  // Only track LORF projects — those with a .lorf/ directory
+  const lorfDir = join(projectDir, ".lorf");
+  if (!existsSync(lorfDir)) {
+    cache.set(projectDir, null);
+    return null;
+  }
 
   let slug = basename(projectDir);
 
   try {
-    const lorfPath = join(projectDir, ".lorf", "project.md");
+    const lorfPath = join(lorfDir, "project.md");
     const content = readFileSync(lorfPath, "utf-8");
     const fm = parseFrontmatter(content);
     slug = fm.content_slug ?? fm.slug ?? basename(projectDir);
   } catch {
-    // No .lorf/project.md — use directory basename
+    // .lorf/ exists but no project.md — use directory basename
   }
 
   cache.set(projectDir, slug);
@@ -62,7 +70,7 @@ export function resolveSlug(projectDir: string): string {
 
 /**
  * Build a complete directory-name-to-slug mapping.
- * Scans all directories under PROJECT_ROOT.
+ * Only includes LORF projects (those with .lorf/ directories).
  * Called at startup + refreshed every 10 cycles (5 min at 30s intervals).
  */
 export function buildSlugMap(): Map<string, string> {
@@ -79,13 +87,23 @@ export function buildSlugMap(): Map<string, string> {
 
     for (const dir of dirs) {
       const slug = resolveSlug(join(PROJECT_ROOT, dir));
-      map.set(dir, slug);
+      if (slug) {
+        map.set(dir, slug);
+      }
     }
   } catch {
     // PROJECT_ROOT doesn't exist or isn't readable
   }
 
   return map;
+}
+
+/**
+ * Check if a directory name belongs to a LORF project.
+ */
+export function isLorfProject(dirName: string): boolean {
+  const slug = resolveSlug(join(PROJECT_ROOT, dirName));
+  return slug !== null;
 }
 
 /**

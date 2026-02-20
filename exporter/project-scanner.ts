@@ -123,6 +123,9 @@ export function scanProjectTokens(): ProjectTokenMap {
     const projectName = resolveProjectName(dirName);
     const projectSlug = resolveSlug(join(PROJECT_ROOT, projectName));
 
+    // Skip non-LORF projects
+    if (!projectSlug) continue;
+
     // Find all .jsonl files in this project dir
     let files: string[];
     try {
