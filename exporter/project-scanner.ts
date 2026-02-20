@@ -8,6 +8,7 @@ import { readdirSync, readFileSync, statSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { deriveProjectName } from "./process-scanner";
+import { resolveSlug } from "./slug-resolver";
 
 const PROJECTS_DIR = join(homedir(), ".claude", "projects");
 
@@ -30,6 +31,58 @@ function decodeDirName(dirName: string): string {
   return dirName.replace(/^-/, "/").replace(/-/g, "/");
 }
 
+// ─── Filesystem-aware project name resolution ───────────────────────────────
+
+const PROJECT_ROOT = "/Users/bigviking/Documents/github/projects";
+
+let cachedProjectDirs: string[] | null = null;
+
+function getProjectDirs(): string[] {
+  if (cachedProjectDirs) return cachedProjectDirs;
+  try {
+    cachedProjectDirs = readdirSync(PROJECT_ROOT)
+      .filter((d) => {
+        try { return statSync(join(PROJECT_ROOT, d)).isDirectory(); } catch { return false; }
+      })
+      .sort((a, b) => b.length - a.length); // Longest first for prefix matching
+  } catch {
+    cachedProjectDirs = [];
+  }
+  return cachedProjectDirs;
+}
+
+/**
+ * Resolve an encoded ~/.claude/projects/ directory name to a project name.
+ *
+ * Matches the remainder after the known project root against actual directory
+ * names on disk (longest first). Case-insensitive because macOS HFS+/APFS is.
+ * Falls back to deriveProjectName() for paths outside known roots.
+ */
+export function resolveProjectName(encodedDirName: string): string {
+  const actualDirs = getProjectDirs();
+  const encodedRoot = PROJECT_ROOT.replace(/\//g, "-"); // -Users-bigviking-Documents-github-projects
+  const lowerEncoded = encodedDirName.toLowerCase();
+  const lowerRoot = encodedRoot.toLowerCase();
+
+  if (lowerEncoded.startsWith(lowerRoot + "-")) {
+    const remainder = encodedDirName.slice(encodedRoot.length + 1);
+    const lowerRemainder = remainder.toLowerCase();
+
+    for (const dir of actualDirs) {
+      const lowerDir = dir.toLowerCase();
+      if (lowerRemainder === lowerDir || lowerRemainder.startsWith(lowerDir + "-")) {
+        return dir;
+      }
+    }
+
+    // No match on disk — fall back to first hyphen-separated segment
+    return remainder.split("-")[0] || "unknown";
+  }
+
+  // Not under the known project root — use legacy logic
+  return deriveProjectName(decodeDirName(encodedDirName));
+}
+
 // ─── JSONL scanner ──────────────────────────────────────────────────────────
 
 /**
@@ -40,6 +93,7 @@ function decodeDirName(dirName: string): string {
  * Deduplicates by requestId to avoid counting streaming chunks multiple times.
  */
 export function scanProjectTokens(): ProjectTokenMap {
+  cachedProjectDirs = null; // Force fresh directory listing each scan
   const result: ProjectTokenMap = new Map();
 
   let projectDirs: string[];
@@ -65,9 +119,9 @@ export function scanProjectTokens(): ProjectTokenMap {
     }
     if (!stat.isDirectory()) continue;
 
-    // Decode dir name to CWD path, then derive project name
-    const cwd = decodeDirName(dirName);
-    const projectName = deriveProjectName(cwd);
+    // Resolve project name using filesystem-aware matching, then map to slug
+    const projectName = resolveProjectName(dirName);
+    const projectSlug = resolveSlug(join(PROJECT_ROOT, projectName));
 
     // Find all .jsonl files in this project dir
     let files: string[];
@@ -121,11 +175,11 @@ export function scanProjectTokens(): ProjectTokenMap {
 
           if (tokens === 0) continue;
 
-          // Accumulate into result map
-          if (!result.has(projectName)) {
-            result.set(projectName, new Map());
+          // Accumulate into result map (keyed by slug, not dir name)
+          if (!result.has(projectSlug)) {
+            result.set(projectSlug, new Map());
           }
-          const dateMap = result.get(projectName)!;
+          const dateMap = result.get(projectSlug)!;
           if (!dateMap.has(date)) {
             dateMap.set(date, {});
           }

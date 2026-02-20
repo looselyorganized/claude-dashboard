@@ -16,26 +16,32 @@ export function initSupabase(url: string, serviceRoleKey: string) {
   });
 }
 
+export function getSupabase(): SupabaseClient {
+  return supabase;
+}
+
 // ─── Projects ──────────────────────────────────────────────────────────────
 
 /**
  * Ensure a project exists in the projects table.
- * Creates it if new, updates last_active if existing.
+ * Upserts on content_slug (canonical PK). Tracks local directory names
+ * in the local_names array.
  */
 export async function upsertProject(
-  name: string,
+  slug: string,
+  localName: string,
   visibility: "public" | "classified",
   timestamp?: Date
 ) {
   const now = timestamp ?? new Date();
   const { error } = await supabase.from("projects").upsert(
     {
-      name,
+      content_slug: slug,
       visibility,
       first_seen: now.toISOString(),
       last_active: now.toISOString(),
     },
-    { onConflict: "name", ignoreDuplicates: false }
+    { onConflict: "content_slug", ignoreDuplicates: false }
   );
 
   if (error) {
@@ -43,7 +49,24 @@ export async function upsertProject(
     await supabase
       .from("projects")
       .update({ last_active: now.toISOString(), visibility })
-      .eq("name", name);
+      .eq("content_slug", slug);
+  }
+
+  // Ensure localName is in the local_names array
+  if (localName && localName !== slug) {
+    const { data: existing } = await supabase
+      .from("projects")
+      .select("local_names")
+      .eq("content_slug", slug)
+      .single();
+
+    const currentNames: string[] = (existing?.local_names as string[]) ?? [];
+    if (!currentNames.includes(localName)) {
+      await supabase
+        .from("projects")
+        .update({ local_names: [...currentNames, localName] })
+        .eq("content_slug", slug);
+    }
   }
 }
 
@@ -51,16 +74,14 @@ export async function upsertProject(
  * Update a project's event count and last_active time.
  */
 export async function updateProjectActivity(
-  name: string,
+  slug: string,
   eventCount: number,
   lastActive: Date
 ) {
-  await supabase.rpc("", {}); // Can't use rpc for this, use raw update
-  // Increment total_events by eventCount
   const { data: current } = await supabase
     .from("projects")
     .select("total_events")
-    .eq("name", name)
+    .eq("content_slug", slug)
     .single();
 
   if (current) {
@@ -70,7 +91,7 @@ export async function updateProjectActivity(
         total_events: current.total_events + eventCount,
         last_active: lastActive.toISOString(),
       })
-      .eq("name", name);
+      .eq("content_slug", slug);
   }
 }
 
@@ -81,7 +102,7 @@ export async function updateProjectActivity(
  * Handles batching to stay within Supabase limits.
  */
 export async function insertEvents(entries: LogEntry[]) {
-  if (entries.length === 0) return { inserted: 0, errors: 0 };
+  if (entries.length === 0) return { inserted: 0, errors: 0, insertedByProject: {} as Record<string, number> };
 
   const rows = entries
     .filter((e) => e.parsedTimestamp) // Skip entries we can't timestamp
@@ -96,11 +117,16 @@ export async function insertEvents(entries: LogEntry[]) {
 
   let inserted = 0;
   let errors = 0;
+  const insertedByProject: Record<string, number> = {};
   const BATCH_SIZE = 500;
 
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
     const batch = rows.slice(i, i + BATCH_SIZE);
-    const { error } = await supabase.from("events").insert(batch);
+    // Use upsert with ignoreDuplicates to skip events that already exist
+    // (unique index on project, event_type, event_text, timestamp)
+    const { error } = await supabase
+      .from("events")
+      .upsert(batch, { onConflict: "project,event_type,event_text,timestamp", ignoreDuplicates: true });
     if (error) {
       console.error(
         `  Error inserting batch ${i}-${i + batch.length}:`,
@@ -109,18 +135,23 @@ export async function insertEvents(entries: LogEntry[]) {
       errors += batch.length;
     } else {
       inserted += batch.length;
+      for (const row of batch) {
+        if (row.project) {
+          insertedByProject[row.project] = (insertedByProject[row.project] ?? 0) + 1;
+        }
+      }
     }
   }
 
-  return { inserted, errors };
+  return { inserted, errors, insertedByProject };
 }
 
 // ─── Per-project event aggregation type ───────────────────────────────────
 
-/** project → date → { sessions, messages, toolCalls } */
+/** project → date → { sessions, messages, toolCalls, agentSpawns } */
 export type ProjectEventAggregates = Map<
   string,
-  Map<string, { sessions: number; messages: number; toolCalls: number }>
+  Map<string, { sessions: number; messages: number; toolCalls: number; agentSpawns: number }>
 >;
 
 // ─── Daily Metrics ─────────────────────────────────────────────────────────
@@ -188,7 +219,7 @@ export async function syncProjectDailyMetrics(
   let errors = 0;
 
   // Build a unified set of (project, date) keys from both sources
-  const keys = new Map<string, { tokens?: Record<string, number>; events?: { sessions: number; messages: number; toolCalls: number } }>();
+  const keys = new Map<string, { tokens?: Record<string, number>; events?: { sessions: number; messages: number; toolCalls: number; agentSpawns: number } }>();
 
   const makeKey = (project: string, date: string) => `${project}\0${date}`;
 
@@ -223,7 +254,7 @@ export async function syncProjectDailyMetrics(
       try {
         const { data: existing } = await supabase
           .from("daily_metrics")
-          .select("id, tokens, sessions, messages, tool_calls")
+          .select("id, tokens, sessions, messages, tool_calls, agent_spawns")
           .eq("date", row.date)
           .eq("project", row.project)
           .maybeSingle();
@@ -236,6 +267,7 @@ export async function syncProjectDailyMetrics(
             updates.sessions = row.events.sessions;
             updates.messages = row.events.messages;
             updates.tool_calls = row.events.toolCalls;
+            updates.agent_spawns = row.events.agentSpawns;
           }
           if (Object.keys(updates).length > 0) {
             await supabase
@@ -251,6 +283,7 @@ export async function syncProjectDailyMetrics(
             sessions: row.events?.sessions ?? null,
             messages: row.events?.messages ?? null,
             tool_calls: row.events?.toolCalls ?? null,
+            agent_spawns: row.events?.agentSpawns ?? null,
           });
         }
         synced++;
@@ -311,4 +344,27 @@ export async function updateFacilityStatus(update: FacilityUpdate) {
   if (error) {
     console.error("Error updating facility status:", error.message);
   }
+}
+
+// ─── Event Pruning ──────────────────────────────────────────────────────────
+
+/**
+ * Delete events older than the retention period.
+ * Aggregated data lives in daily_metrics; old events only bloat the table.
+ */
+export async function pruneOldEvents(retentionDays = 14) {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - retentionDays);
+
+  const { count, error } = await supabase
+    .from("events")
+    .delete({ count: "exact" })
+    .lt("timestamp", cutoff.toISOString());
+
+  if (error) {
+    console.error("Error pruning old events:", error.message);
+    return 0;
+  }
+
+  return count ?? 0;
 }

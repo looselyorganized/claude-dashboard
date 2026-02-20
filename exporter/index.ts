@@ -21,12 +21,14 @@ import { scanProcesses, getFacilityState } from "./process-scanner";
 import { scanProjectTokens, computeTokensByProject } from "./project-scanner";
 import {
   initSupabase,
+  getSupabase,
   upsertProject,
   updateProjectActivity,
   insertEvents,
   syncDailyMetrics,
   syncProjectDailyMetrics,
   updateFacilityStatus,
+  pruneOldEvents,
   type FacilityUpdate,
   type ProjectEventAggregates,
 } from "./sync";
@@ -34,6 +36,9 @@ import {
   loadVisibilityCache,
   getVisibility,
 } from "./visibility-cache";
+import { buildSlugMap, clearSlugCache } from "./slug-resolver";
+import { readFileSync, writeFileSync } from "fs";
+import { join, dirname } from "path";
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
@@ -62,8 +67,65 @@ loadVisibilityCache();
 
 const tailer = new LogTailer();
 
-// Track projects we've already ensured exist in the DB
+// Track projects we've already ensured exist in the DB (by slug)
 const knownProjects = new Set<string>();
+
+// Directory name → slug mapping, refreshed every 10 cycles
+let slugMap: Map<string, string> = new Map();
+
+const SLUG_MAPPING_FILE = join(dirname(new URL(import.meta.url).pathname), ".slug-mapping.json");
+
+function loadSavedSlugMapping(): Record<string, string> {
+  try {
+    return JSON.parse(readFileSync(SLUG_MAPPING_FILE, "utf-8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveSlugMapping(mapping: Record<string, string>) {
+  writeFileSync(SLUG_MAPPING_FILE, JSON.stringify(mapping, null, 2));
+}
+
+async function refreshSlugMap() {
+  clearSlugCache();
+  slugMap = buildSlugMap();
+  console.log(`  Slug map: ${slugMap.size} projects mapped`);
+
+  // Detect slug changes: if a dir name previously mapped to a different slug
+  const saved = loadSavedSlugMapping();
+  const current: Record<string, string> = {};
+  for (const [dirName, slug] of slugMap) {
+    current[dirName] = slug;
+    const oldSlug = saved[dirName];
+    if (oldSlug && oldSlug !== slug) {
+      console.log(`  Slug change detected: ${dirName}: ${oldSlug} → ${slug}`);
+      // Migrate existing telemetry data from old slug to new slug
+      try {
+        const sb = getSupabase();
+        await sb.from("events").update({ project: slug }).eq("project", oldSlug);
+        await sb.from("daily_metrics").update({ project: slug }).eq("project", oldSlug);
+        console.log(`  Migrated telemetry data: ${oldSlug} → ${slug}`);
+      } catch (err) {
+        console.error(`  Error migrating slug ${oldSlug} → ${slug}:`, err);
+      }
+    }
+  }
+  saveSlugMapping(current);
+}
+
+/** Map a directory name (from events.log) to its content_slug */
+function toSlug(dirName: string): string {
+  return slugMap.get(dirName) ?? dirName;
+}
+
+/** Map all entry.project fields from dir names to slugs */
+function mapEntriesToSlugs(entries: LogEntry[]): LogEntry[] {
+  return entries.map((e) => ({
+    ...e,
+    project: e.project ? toSlug(e.project) : e.project,
+  }));
+}
 
 // Cache project token totals for facility status updates
 let cachedTokensByProject: Record<string, number> = {};
@@ -71,23 +133,30 @@ let cachedTokensByProject: Record<string, number> = {};
 // ─── Ensure projects exist ─────────────────────────────────────────────────
 
 async function ensureProjects(entries: LogEntry[]) {
-  const newProjects = new Set<string>();
+  const newSlugs = new Set<string>();
+  const slugToLocalName = new Map<string, string>();
+
   for (const entry of entries) {
-    if (entry.project && !knownProjects.has(entry.project)) {
-      newProjects.add(entry.project);
+    if (!entry.project) continue;
+    const slug = toSlug(entry.project);
+    if (!knownProjects.has(slug)) {
+      newSlugs.add(slug);
+      slugToLocalName.set(slug, entry.project);
     }
   }
 
-  for (const name of newProjects) {
-    const visibility = getVisibility(name);
-    const firstEntry = entries.find((e) => e.project === name);
+  for (const slug of newSlugs) {
+    const localName = slugToLocalName.get(slug) ?? slug;
+    const visibility = getVisibility(localName);
+    const firstEntry = entries.find((e) => toSlug(e.project) === slug);
     await upsertProject(
-      name,
+      slug,
+      localName,
       visibility,
       firstEntry?.parsedTimestamp ?? undefined
     );
-    knownProjects.add(name);
-    console.log(`  Project registered: ${name} (${visibility})`);
+    knownProjects.add(slug);
+    console.log(`  Project registered: ${slug}${slug !== localName ? ` (dir: ${localName})` : ""} (${visibility})`);
   }
 }
 
@@ -129,23 +198,25 @@ function aggregateProjectEvents(entries: LogEntry[]): ProjectEventAggregates {
   for (const entry of entries) {
     if (!entry.project || !entry.parsedTimestamp) continue;
 
+    const slug = toSlug(entry.project);
     const date = entry.parsedTimestamp.toISOString().split("T")[0];
 
-    let dateMap = agg.get(entry.project);
+    let dateMap = agg.get(slug);
     if (!dateMap) {
       dateMap = new Map();
-      agg.set(entry.project, dateMap);
+      agg.set(slug, dateMap);
     }
 
     let counts = dateMap.get(date);
     if (!counts) {
-      counts = { sessions: 0, messages: 0, toolCalls: 0 };
+      counts = { sessions: 0, messages: 0, toolCalls: 0, agentSpawns: 0 };
       dateMap.set(date, counts);
     }
 
     if (entry.eventType === "session_start") counts.sessions++;
     else if (entry.eventType === "response_finish") counts.messages++;
     else if (entry.eventType === "tool") counts.toolCalls++;
+    else if (entry.eventType === "agent_spawn") counts.agentSpawns++;
   }
 
   return agg;
@@ -156,6 +227,9 @@ function aggregateProjectEvents(entries: LogEntry[]): ProjectEventAggregates {
 async function backfill() {
   console.log("Starting backfill...");
 
+  // 0. Build slug map
+  await refreshSlugMap();
+
   // 1. Read all events
   console.log("  Reading events.log...");
   const allEntries = tailer.readAll();
@@ -165,26 +239,31 @@ async function backfill() {
   console.log("  Registering projects...");
   await ensureProjects(allEntries);
 
-  // 3. Insert events in batches
+  // 3. Insert events in batches (with project mapped to slug)
   console.log("  Inserting events...");
-  const { inserted, errors } = await insertEvents(allEntries);
+  const mappedEntries = mapEntriesToSlugs(allEntries);
+  const { inserted, errors, insertedByProject } = await insertEvents(mappedEntries);
   console.log(`  Inserted: ${inserted}, Errors: ${errors}`);
 
-  // 4. Update project activity counts
+  // 4. Update project activity counts (using actually-inserted counts, mapped to slugs)
   console.log("  Updating project activity...");
-  const projectCounts: Record<string, { count: number; lastActive: Date }> = {};
+  const slugLastActive: Record<string, Date> = {};
   for (const entry of allEntries) {
-    if (!entry.project) continue;
-    if (!projectCounts[entry.project]) {
-      projectCounts[entry.project] = { count: 0, lastActive: new Date(0) };
-    }
-    projectCounts[entry.project].count++;
-    if (entry.parsedTimestamp && entry.parsedTimestamp > projectCounts[entry.project].lastActive) {
-      projectCounts[entry.project].lastActive = entry.parsedTimestamp;
+    if (!entry.project || !entry.parsedTimestamp) continue;
+    const slug = toSlug(entry.project);
+    if (!slugLastActive[slug] || entry.parsedTimestamp > slugLastActive[slug]) {
+      slugLastActive[slug] = entry.parsedTimestamp;
     }
   }
-  for (const [name, data] of Object.entries(projectCounts)) {
-    await updateProjectActivity(name, data.count, data.lastActive);
+  // Aggregate inserted counts by slug (insertedByProject keys are dir names)
+  const insertedBySlug: Record<string, number> = {};
+  for (const [dirName, count] of Object.entries(insertedByProject)) {
+    const slug = toSlug(dirName);
+    insertedBySlug[slug] = (insertedBySlug[slug] ?? 0) + count;
+  }
+  for (const [slug, count] of Object.entries(insertedBySlug)) {
+    const lastActive = slugLastActive[slug] ?? new Date();
+    await updateProjectActivity(slug, count, lastActive);
   }
 
   // 5. Sync daily metrics from stats-cache.json
@@ -219,28 +298,32 @@ async function incrementalSync() {
     // Ensure projects exist
     await ensureProjects(newEntries);
 
-    // Insert new events
-    const { inserted, errors } = await insertEvents(newEntries);
+    // Insert new events (with project mapped to slug)
+    const mappedEntries = mapEntriesToSlugs(newEntries);
+    const { inserted, errors, insertedByProject } = await insertEvents(mappedEntries);
     if (inserted > 0 || errors > 0) {
       console.log(
         `  ${new Date().toLocaleTimeString()} — ${inserted} events synced${errors > 0 ? `, ${errors} errors` : ""}`
       );
     }
 
-    // Update project activity
-    const projectCounts: Record<string, { count: number; lastActive: Date }> = {};
+    // Update project activity (using actually-inserted counts, mapped to slugs)
+    const slugLastActive: Record<string, Date> = {};
     for (const entry of newEntries) {
-      if (!entry.project) continue;
-      if (!projectCounts[entry.project]) {
-        projectCounts[entry.project] = { count: 0, lastActive: new Date(0) };
-      }
-      projectCounts[entry.project].count++;
-      if (entry.parsedTimestamp && entry.parsedTimestamp > projectCounts[entry.project].lastActive) {
-        projectCounts[entry.project].lastActive = entry.parsedTimestamp;
+      if (!entry.project || !entry.parsedTimestamp) continue;
+      const slug = toSlug(entry.project);
+      if (!slugLastActive[slug] || entry.parsedTimestamp > slugLastActive[slug]) {
+        slugLastActive[slug] = entry.parsedTimestamp;
       }
     }
-    for (const [name, data] of Object.entries(projectCounts)) {
-      await updateProjectActivity(name, data.count, data.lastActive);
+    const insertedBySlug: Record<string, number> = {};
+    for (const [dirName, count] of Object.entries(insertedByProject)) {
+      const slug = toSlug(dirName);
+      insertedBySlug[slug] = (insertedBySlug[slug] ?? 0) + count;
+    }
+    for (const [slug, count] of Object.entries(insertedBySlug)) {
+      const lastActive = slugLastActive[slug] ?? new Date();
+      await updateProjectActivity(slug, count, lastActive);
     }
   }
 
@@ -256,15 +339,15 @@ async function syncFacilityStatus() {
   const modelStats = readModelStats();
   const tokenStats = readTokenStats();
 
-  // Compute per-project agent breakdown
+  // Compute per-project agent breakdown (keyed by slug)
   const agentsByProject: Record<string, { count: number; active: number }> = {};
   for (const proc of facility.processes) {
-    if (proc.projectName === "unknown") continue;
-    if (!agentsByProject[proc.projectName]) {
-      agentsByProject[proc.projectName] = { count: 0, active: 0 };
+    if (proc.slug === "unknown") continue;
+    if (!agentsByProject[proc.slug]) {
+      agentsByProject[proc.slug] = { count: 0, active: 0 };
     }
-    agentsByProject[proc.projectName].count++;
-    if (proc.isActive) agentsByProject[proc.projectName].active++;
+    agentsByProject[proc.slug].count++;
+    if (proc.isActive) agentsByProject[proc.slug].active++;
   }
 
   const update: FacilityUpdate = {
@@ -314,6 +397,7 @@ async function maybeSyncDailyMetrics() {
 // ─── Periodic project daily metrics sync ────────────────────────────────────
 
 let lastProjectSync = "";
+let lastPruneDate = "";
 
 async function maybeSyncProjectDailyMetrics() {
   const today = new Date().toISOString().split("T")[0];
@@ -332,15 +416,46 @@ async function maybeSyncProjectDailyMetrics() {
   }
 }
 
+async function maybePruneEvents() {
+  const today = new Date().toISOString().split("T")[0];
+  if (today === lastPruneDate) return;
+
+  try {
+    const pruned = await pruneOldEvents(14);
+    if (pruned > 0) {
+      console.log(`  Pruned ${pruned} events older than 14 days`);
+    }
+    lastPruneDate = today;
+  } catch (err) {
+    console.error("Error pruning events:", err);
+  }
+}
+
 // ─── Main loop ─────────────────────────────────────────────────────────────
 
 async function main() {
   if (IS_BACKFILL) {
     await backfill();
   } else {
+    // Build initial slug map
+    await refreshSlugMap();
+
     // Prime the tailer — read existing file to set offset, but don't backfill
     console.log("Priming log tailer (skipping existing entries)...");
     tailer.readAll(); // Sets offset to end of file
+
+    // Seed token cache from existing facility_status to avoid writing {}
+    console.log("  Loading cached tokens from Supabase...");
+    const { data: facility } = await getSupabase()
+      .from("facility_status")
+      .select("tokens_by_project")
+      .eq("id", 1)
+      .single();
+    if (facility?.tokens_by_project) {
+      cachedTokensByProject = facility.tokens_by_project as Record<string, number>;
+      console.log(`  Loaded ${Object.keys(cachedTokensByProject).length} project token entries`);
+    }
+
     console.log("  Ready — will only sync new events from this point.\n");
   }
 
@@ -352,10 +467,12 @@ async function main() {
     try {
       await incrementalSync();
 
-      // Sync daily metrics every ~10 cycles
+      // Refresh slug map + sync daily metrics + prune every ~10 cycles
       if (cycleCount % 10 === 0) {
+        await refreshSlugMap();
         await maybeSyncDailyMetrics();
         await maybeSyncProjectDailyMetrics();
+        await maybePruneEvents();
       }
       cycleCount++;
     } catch (err) {

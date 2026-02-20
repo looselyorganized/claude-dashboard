@@ -5,6 +5,9 @@
 
 import { execSync } from "child_process";
 import { resolve } from "path";
+import { resolveSlug } from "./slug-resolver";
+
+const PROJECT_ROOT = "/Users/bigviking/Documents/github/projects";
 
 export interface ClaudeProcess {
   pid: number;
@@ -13,6 +16,7 @@ export interface ClaudeProcess {
   uptime: string;
   cwd: string;
   projectName: string;
+  slug: string;
   isActive: boolean;
   model: string;
 }
@@ -29,6 +33,16 @@ export function deriveProjectName(cwd: string): string {
     return parts[idx + 1];
   }
   return parts[parts.length - 1] || "unknown";
+}
+
+/**
+ * Derive content_slug from a working directory.
+ * Uses deriveProjectName to get the dir name, then resolveSlug to get the slug.
+ */
+export function deriveSlug(cwd: string): string {
+  const dirName = deriveProjectName(cwd);
+  if (dirName === "unknown") return "unknown";
+  return resolveSlug(`${PROJECT_ROOT}/${dirName}`);
 }
 
 /**
@@ -107,13 +121,15 @@ export function scanProcesses(): ClaudeProcess[] {
     // Build results
     return claudePids.map((p) => {
       const cwd = cwdMap[p.pid] || "";
+      const projectName = deriveProjectName(cwd);
       return {
         pid: p.pid,
         cpuPercent: p.cpu,
         memMb: p.memMb,
         uptime: p.uptime,
         cwd,
-        projectName: deriveProjectName(cwd),
+        projectName,
+        slug: deriveSlug(cwd),
         isActive: p.cpu > 1 || cafPids.has(p.pid),
         model: "", // Can't determine from ps alone
       };
@@ -129,17 +145,17 @@ export function scanProcesses(): ClaudeProcess[] {
 export function getFacilityState() {
   const processes = scanProcesses();
   const activeProcesses = processes.filter((p) => p.isActive);
-  const projects = [
-    ...new Set(processes.map((p) => p.projectName).filter((n) => n !== "unknown")),
+  const slugs = [
+    ...new Set(processes.map((p) => p.slug).filter((s) => s !== "unknown")),
   ];
 
   return {
     status: activeProcesses.length > 0 ? ("active" as const) : ("dormant" as const),
     activeAgents: activeProcesses.length,
     totalProcesses: processes.length,
-    activeProjects: projects.map((name) => ({
-      name,
-      active: processes.some((p) => p.projectName === name && p.isActive),
+    activeProjects: slugs.map((slug) => ({
+      name: slug,
+      active: processes.some((p) => p.slug === slug && p.isActive),
     })),
     processes,
   };
