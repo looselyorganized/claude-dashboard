@@ -507,8 +507,9 @@ class ProjectTokenScanner:
         return sorted({proj for _fp, (proj, _dates) in self._file_data.items() if proj})
 
     def lo_projects(self) -> set[str]:
-        """Return project names whose session files live under a looselyorganized path."""
-        return {proj for fp, (proj, _dates) in self._file_data.items() if "looselyorganized" in fp and proj}
+        """Return project names whose session files live under an LO org root path."""
+        return {proj for fp, (proj, _dates) in self._file_data.items()
+                if proj and ("looselyorganized" in fp or "-projects-lo-" in fp)}
 
 
 def _format_tokens(n: int) -> str:
