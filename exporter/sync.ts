@@ -149,7 +149,6 @@ export async function insertEvents(entries: LogEntry[]): Promise<InsertEventsRes
     .filter((e) => e.parsedTimestamp)
     .map((e) => ({
       timestamp: e.parsedTimestamp!.toISOString(),
-      project: e.project,
       proj_id: e.project,
       branch: e.branch || null,
       emoji: e.emoji || null,
@@ -166,7 +165,7 @@ export async function insertEvents(entries: LogEntry[]): Promise<InsertEventsRes
     const batch = rows.slice(i, i + BATCH_SIZE);
     const { error } = await supabase
       .from("events")
-      .upsert(batch, { onConflict: "project,event_type,event_text,timestamp", ignoreDuplicates: true });
+      .upsert(batch, { onConflict: "proj_id,event_type,event_text,timestamp", ignoreDuplicates: true });
 
     if (error) {
       console.error(`  Error inserting batch ${i}-${i + batch.length}:`, error.message);
@@ -176,8 +175,8 @@ export async function insertEvents(entries: LogEntry[]): Promise<InsertEventsRes
 
     inserted += batch.length;
     for (const row of batch) {
-      if (row.project) {
-        insertedByProject[row.project] = (insertedByProject[row.project] ?? 0) + 1;
+      if (row.proj_id) {
+        insertedByProject[row.proj_id] = (insertedByProject[row.proj_id] ?? 0) + 1;
       }
     }
   }
@@ -209,7 +208,7 @@ export async function syncDailyMetrics(statsCache: StatsCache): Promise<number> 
 
   const rows = statsCache.dailyActivity.map((day) => ({
     date: day.date,
-    project: null as string | null, // NULL = global aggregate
+    proj_id: null as string | null, // NULL = global aggregate
     messages: day.messageCount,
     sessions: day.sessionCount,
     tool_calls: day.toolCallCount,
@@ -224,7 +223,7 @@ export async function syncDailyMetrics(statsCache: StatsCache): Promise<number> 
     .from("daily_metrics")
     .select("id, date")
     .in("date", dates)
-    .is("project", null);
+    .is("proj_id", null);
 
   const existingByDate = new Map<string, number>();
   for (const row of existingRows ?? []) {
@@ -233,7 +232,7 @@ export async function syncDailyMetrics(statsCache: StatsCache): Promise<number> 
 
   // Split into updates vs inserts
   const toInsert: typeof rows = [];
-  const toUpdate: Array<{ id: number; data: Omit<typeof rows[0], "date" | "project"> }> = [];
+  const toUpdate: Array<{ id: number; data: Omit<typeof rows[0], "date" | "proj_id"> }> = [];
 
   for (const row of rows) {
     const existingId = existingByDate.get(row.date);
@@ -320,19 +319,18 @@ export async function syncProjectDailyMetrics(
     const projectBatch = projects.slice(i, i + FETCH_BATCH);
     const { data: existingRows } = await supabase
       .from("daily_metrics")
-      .select("id, date, project")
+      .select("id, date, proj_id")
       .in("proj_id", projectBatch)
       .in("date", dates);
 
     for (const row of existingRows ?? []) {
-      existingByKey.set(makeKey(row.project, row.date), { id: row.id });
+      existingByKey.set(makeKey(row.proj_id, row.date), { id: row.id });
     }
   }
 
   // Split into updates vs inserts
   interface ProjectDailyMetricsInsert {
     date: string;
-    project: string;
     proj_id: string;
     tokens: Record<string, number> | null;
     sessions: number;
@@ -372,7 +370,6 @@ export async function syncProjectDailyMetrics(
     } else {
       toInsert.push({
         date: row.date,
-        project: row.project,
         proj_id: row.project,
         tokens: row.tokens ?? null,
         sessions: row.events?.sessions ?? 0,
@@ -508,7 +505,6 @@ export interface ProjectTelemetryUpdate {
 
 interface ProjectTelemetryRow {
   proj_id: string;
-  project: string;
   tokens_lifetime: number;
   tokens_today: number;
   models_today: Record<string, number>;
@@ -533,7 +529,6 @@ export async function batchUpsertProjectTelemetry(
   function toRow(u: ProjectTelemetryUpdate): ProjectTelemetryRow {
     const row: ProjectTelemetryRow = {
       proj_id: u.projId,
-      project: u.projId,
       tokens_lifetime: u.tokensLifetime,
       tokens_today: u.tokensToday,
       models_today: u.modelsToday,
@@ -622,7 +617,7 @@ export async function deleteProjectDailyMetrics(): Promise<number> {
   const { count, error } = await supabase
     .from("daily_metrics")
     .delete({ count: "exact" })
-    .not("project", "is", null);
+    .not("proj_id", "is", null);
 
   if (error) {
     console.error("Error deleting per-project daily_metrics:", error.message);
