@@ -13,7 +13,7 @@
 	</array>
 
 	<key>WorkingDirectory</key>
-	<string>/Users/bigviking/Documents/github/projects/looselyorganized/claude-dashboard/exporter</string>
+	<string>/Users/bigviking/Documents/github/projects/lo/claude-dashboard/exporter</string>
 
 	<!-- Always restart if it exits for any reason -->
 	<key>KeepAlive</key>
