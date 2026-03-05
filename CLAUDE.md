@@ -4,29 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Running
 
-**Dashboard (TUI):**
 ```bash
 pip install textual rich
 python3 dashboard.py
 ```
 
-**Exporter (Supabase sync):**
-```bash
-cd exporter
-cp .env.example .env   # fill in Supabase credentials
-bun install
-bun run index.ts              # daemon (incremental sync)
-bun run index.ts --backfill   # backfill all history, then daemon
-```
-
-No tests or linting in either component.
+No tests or linting.
 
 ## Architecture
 
-Two components that read the same `~/.claude/` telemetry files:
-
-1. **`dashboard.py`** — Single-file Python TUI (~2000 lines) for local monitoring
-2. **`exporter/`** — TypeScript/Bun daemon that syncs telemetry to Supabase (lo-site project)
+Single-file Python TUI that reads `~/.claude/` telemetry files for local monitoring. The Supabase exporter that previously lived in `exporter/` has been extracted to the separate `telemetry-exporter` repo.
 
 ### Data Sources
 
@@ -66,35 +53,3 @@ When the stats cache is stale (today's date ≠ `lastComputedDate`), the Stats t
 - **Token formatting**: `_format_tokens()` renders as B/M/K notation
 - **Time range filtering**: `_filter_entries_by_time()` and `_filter_daily_by_range()` filter by Today/7d/All, used across all views
 - **Compact mode**: `_compact_entries()` collapses consecutive same-type events into `(xN)` groups
-
----
-
-## Exporter (`exporter/`)
-
-TypeScript/Bun daemon that reads the same `~/.claude/` files and pushes telemetry to the **lo-site** Supabase project.
-
-### Files
-
-| File | Purpose |
-|------|---------|
-| `index.ts` | Entry point — backfill, incremental sync loop, facility status |
-| `sync.ts` | Supabase upsert functions for events, daily_metrics, facility_status, projects |
-| `parsers.ts` | Log line parsing, timestamp parsing, LogTailer, stats file readers |
-| `process-scanner.ts` | Detects running Claude processes via `ps`/`lsof` |
-| `project-scanner.ts` | Scans JSONL conversation files for per-project token breakdowns |
-| `visibility-cache.ts` | Maps project names to public/private visibility |
-
-### Supabase Tables
-
-| Table | What it stores |
-|-------|---------------|
-| `events` | Every log line — timestamp, project, branch, emoji, event type, text |
-| `projects` | One row per project — name, visibility, first_seen, last_active, total_events |
-| `daily_metrics` | Global rows (project IS NULL) from stats-cache.json + per-project rows with tokens, sessions, messages, tool_calls |
-| `facility_status` | Singleton live snapshot — status, active_agents, agents_by_project, tokens, model_stats, hour_distribution |
-
-### Sync Cadence
-
-- **Every cycle** (30s active / 5min dormant): new events + facility status
-- **Every ~10 cycles**: daily metrics + per-project daily metrics
-- **Backfill mode** (`--backfill`): full historical import, then switches to daemon

@@ -1,7 +1,7 @@
 ---
 proj_id: "proj_ab98181f-8898-4189-bd2c-0843a7c7fafe"
 title: "Claude Dashboard"
-description: "Real-time terminal dashboard and Supabase exporter for monitoring Claude Code activity."
+description: "Real-time terminal dashboard for monitoring Claude Code activity."
 status: "explore"
 state: "public"
 topics:
@@ -14,19 +14,12 @@ stack:
   - Python
   - Textual
   - Rich
-  - TypeScript
-  - Bun
-  - Supabase
-infrastructure:
-  - Supabase
-  - Bun
-  - launchd
 agents:
   - name: "claude-code"
     role: "AI coding agent (Claude Code)"
 ---
 
-A real-time terminal dashboard and Supabase exporter for monitoring Claude Code activity. Reads `~/.claude/` telemetry files to provide live event feeds, token usage tracking, and process monitoring — locally via a Textual TUI and remotely via a Bun-powered sync daemon.
+A real-time terminal dashboard for monitoring Claude Code activity. Reads `~/.claude/` telemetry files to provide live event feeds, token usage tracking, and process monitoring via a Textual TUI.
 
 ## Capabilities
 
@@ -34,14 +27,7 @@ A real-time terminal dashboard and Supabase exporter for monitoring Claude Code 
 - **Token Analytics** — Per-model token breakdowns (Opus, Sonnet, Haiku) with cache hit ratios and daily totals
 - **Process Monitoring** — CPU, memory, uptime, MCP server count, and subagent status for all running Claude instances
 - **Agent Tree Visualization** — Stack-based session-to-agent hierarchy reconstruction with live activity indicators
-- **Supabase Exporter** — Bun daemon syncing events, daily metrics, project data, and facility status to Postgres
 
 ## Architecture
 
-Single-file Python TUI (Textual/Rich) polls `~/.claude/` files at 0.5-30s intervals. TypeScript/Bun exporter reads the same files and upserts to Supabase Postgres. Both components are read-only consumers of Claude Code's native telemetry.
-
-## Infrastructure
-
-- **Supabase** — Hosted Postgres for telemetry storage and sync (via `@supabase/supabase-js`)
-- **Bun** — TypeScript runtime powering the exporter daemon
-- **launchd** — macOS service management keeping the exporter alive via plist
+Single-file Python TUI (Textual/Rich) polls `~/.claude/` files at 0.5-30s intervals. Read-only consumer of Claude Code's native telemetry. The Supabase exporter has been extracted to the separate `telemetry-exporter` repo.
